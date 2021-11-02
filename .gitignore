@@ -1,0 +1,7 @@
+## ignore files
+## date 20211102
+/cmake-build-debug
+/.idea
+/.vscode
+/build
+/maps
