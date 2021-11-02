@@ -1,0 +1,1 @@
+/usr/bin/c++  -std=c++14 -O2  -msse4 -O3 -DNDEBUG  -rdynamic CMakeFiles/pose_graph_g2o_SE3.dir/pose_graph_g2o_SE3.cpp.o  -o pose_graph_g2o_SE3  -L/usr/local/lib -Wl,-rpath,/usr/local/lib -lg2o_core -lg2o_stuff -lg2o_types_slam3d 
