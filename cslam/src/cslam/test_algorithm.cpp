@@ -158,7 +158,7 @@ public:
     virtual void computeError() override {
         SE3d v1 = (static_cast<VertexSE3LieAlgebra *>(_vertices[0]))->estimate();
         SE3d v2 = (static_cast<VertexSE3LieAlgebra *>(_vertices[1]))->estimate();
-        _error = (_measurement.inverse() * v1.inverse() * v2).log();
+        _error = (_measurement.inverse()* v2 * v1.inverse()).log();
     }
 
     // 雅可比计算
@@ -181,15 +181,15 @@ public:
  * @param roll 
  * @param pitch 
  * @param yaw 
- * @return Pose 
+ * @return Pose  逆时针旋转为正
  */
 Pose get_pose(double x, double y, double z, double roll, double pitch, double yaw) {
-    Eigen::Vector3d eulerAngle(roll, pitch, yaw);  // 四元数转欧拉角
-    Eigen::AngleAxisd rollAngle(AngleAxisd(eulerAngle(0), Vector3d::UnitX()));
-    Eigen::AngleAxisd pitchAngle(AngleAxisd(eulerAngle(1), Vector3d::UnitY()));
-    Eigen::AngleAxisd yawAngle(AngleAxisd(eulerAngle(2), Vector3d::UnitZ()));
+    Eigen::AngleAxisd rollAngle(PI * roll, Vector3d(1, 0, 0));
+    Eigen::AngleAxisd pitchAngle(PI * pitch, Vector3d(0, 1, 0));
+    Eigen::AngleAxisd yawAngle(PI * yaw, Vector3d(0, 0, 1));
     Eigen::Quaterniond qd;  // 四元数
     qd = yawAngle * pitchAngle * rollAngle;
+    qd.normalize();
     Eigen::Vector3d vd(x, y, z);  // 位置
 
     return Pose(vd, qd);
@@ -207,8 +207,9 @@ Pose get_pose(double x, double y, double z, double roll, double pitch, double ya
  * @return true 
  * @return false 
  */
-bool get_pose_data(std::string &file_path, std::vector<Pose> &truth, std::vector<Pose> &real, std::vector<Pose> &pc,
-                   double m, double n) {
+bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth, std::vector<Eigen::Isometry3d> &real,
+                   std::vector<Eigen::Isometry3d> &pc,
+                   std::vector<Eigen::Isometry3d> &noise, double m, double n) {
     std::ifstream fin(file_path);
     if (!fin) {
         ROS_INFO_STREAM("file " << file_path << " does not exist.");
@@ -217,60 +218,72 @@ bool get_pose_data(std::string &file_path, std::vector<Pose> &truth, std::vector
 
     unsigned int id = 0;
     double x = 0, y = 0, z = 0, roll = 0, pitch = 0, yaw = 0;
-    double x_n = 0, y_n = 0, z_n = 0, roll_n = 0, pitch_n = 0, yaw_n = 0;
-    double x_before = 0, y_before = 0, yaw_before = 0;        // 不带噪声的前一个xyz位姿 仿真时z r p一直为0，不考虑
-    double x_n_before = 0, y_n_before = 0, yaw_n_before = 0;  // 带噪声的前一个xyz位姿 仿真时z r p一直为0，不考虑
-    double delta_x = 0, delta_y = 0, delta_yaw = 0;           // 前后数据差 真实位姿变化
-    double delta_x_n = 0, delta_y_n = 0, delta_yaw_n = 0;     // 前后数据差 带有噪声位姿变化
+
+    Eigen::Isometry3d node_pose_before = Eigen::Isometry3d::Identity(); // 之前的真实位姿
+    Eigen::Isometry3d node_pose_now = Eigen::Isometry3d::Identity();    // 当前的真实位姿
+    Eigen::Isometry3d node_pose_real = Eigen::Isometry3d::Identity();   // 测量位姿带噪声
+    Eigen::Isometry3d node_pose_change = Eigen::Isometry3d::Identity(); // 真实位姿变化
+    Eigen::Isometry3d node_pc_n = Eigen::Isometry3d::Identity();        // 测量位姿变化带噪声
+    Eigen::Isometry3d pc_noise = Eigen::Isometry3d::Identity();         // 位姿噪声
 
     id = 0;
     while (!fin.eof()) {
         fin >> x >> y >> z >> roll >> pitch >> yaw;
 
-        roll = roll * PI;
-        pitch = pitch * PI;
-        yaw = yaw * PI;
-
         id++;  // 节点id
         auto temp = get_pose(x, y, z, roll, pitch, yaw);
-        truth.push_back(temp);  // 添加机器人1的位置真值
+
+        node_pose_now = Eigen::Isometry3d::Identity();
+
+        node_pose_now.prerotate(temp.second);
+        node_pose_now.pretranslate(temp.first);
+
+        truth.push_back(node_pose_now);  // 添加机器人1的位置真值
 
         // 添加机器人1带噪声的位姿
         if (1 == id) {
-            // 初始化 应该都为0
-            x_n_before = x_before = x;
-            y_n_before = y_before = y;
-            yaw_n_before = yaw_before = yaw;
-
-            real.push_back(temp);  // 初始点不带噪声
+            // 初始化 应该都为单位阵
+            node_pose_before = node_pose_now;
+            real.push_back(node_pose_now);  // 初始点不带噪声
         } else {
             // 本次主要的位姿变化，真实变化
-            delta_x = x - x_before;
-            delta_y = y - y_before;
-            delta_yaw = yaw - yaw_before;
+            node_pose_change = Eigen::Isometry3d::Identity();
+            node_pose_change = node_pose_now * (node_pose_before.inverse());
+            // node_pose_change = node_pose_before * node_pose_now.inverse();
+
+            // 噪声
+            srand((int) time(NULL) + id);                     // 产生随机种子  把0换成NULL也行
+            double noise_x = 0;
+            double noise_y = 0;
+            double noise_yaw = 0;
+            if (node_pose_change.translation().x() != 0 || node_pose_change.translation().y() != 0) {
+                // noise_x = random(-50, 50) * m;
+                // noise_y = random(-50, 50) * m;
+            }
+            if (node_pose_change.rotation().eulerAngles(0, 1, 2).z() != 0) {
+                noise_yaw = random(-50, 50) * n;
+            }
+
+            ROS_INFO_STREAM("noise set " << noise_x << " " << noise_y << " " << noise_yaw);
+            auto temp_noise = get_pose(noise_x, noise_y, 0, 0, 0, noise_yaw);
+            pc_noise = Eigen::Isometry3d::Identity();
+            pc_noise.pretranslate(temp_noise.first);
+            pc_noise.prerotate(temp_noise.second);
+            noise.push_back(pc_noise);
 
             // 带有噪声的变化
-            srand((int) time(NULL) + id);                     // 产生随机种子  把0换成NULL也行
-            delta_x_n = delta_x + random(-50, 50) * m;  // -50 50 0.01 -> -0.5 0.5
-            delta_y_n = delta_y + random(-50, 50) * m;
-            delta_yaw_n = delta_yaw + random(-50, 50) * n;  // -50 50 0.005 -> -0.025 0.025
-            auto temp_pc_n = get_pose(delta_x_n, delta_y_n, 0, 0, 0, delta_yaw_n);
-            pc.push_back(temp_pc_n);
+//            ROS_INFO_STREAM("node_pc " << endl << node_pose_change.translation() << endl <<
+//                                       node_pose_change.rotation().eulerAngles(0, 1, 2).z() / PI << endl);
+            node_pc_n = pc_noise * node_pose_change;
+            pc.push_back(node_pc_n);
+//            ROS_INFO_STREAM("node_pc_n " << endl << node_pc_n.translation() << endl <<
+//                                         node_pc_n.rotation().eulerAngles(0, 1, 2).z() / PI << endl);
 
             // 加噪声 累计误差模拟，带误差的变化
-            x_n = x_n_before + delta_x_n;  // -50 50 0.01 -> -0.5 0.5
-            y_n = y_n_before + delta_y_n;
-            yaw_n = yaw_n_before + delta_yaw_n;  // -50 50 0.005 -> -0.025 0.025
-            auto temp_pose_n = get_pose(x_n, y_n, z, roll, pitch, yaw_n);
-            real.push_back(temp_pose_n);
+            node_pose_real = node_pc_n * node_pose_real;
+            real.push_back(node_pose_real);
 
-            // 更新存储过去量
-            x_before = x;
-            y_before = y;
-            yaw_before = yaw;
-            x_n_before = x_n;
-            y_n_before = y_n;
-            yaw_n_before = yaw_n;
+            node_pose_before = node_pose_now;
         }
     }
     fin.close();
@@ -359,6 +372,68 @@ void create_marker_array(visualization_msgs::MarkerArray &markers, const std::ve
 }
 
 
+bool use_const_inf = false;
+double const_stddev_x = 0.5;
+double const_stddev_q = 0.1;
+
+double var_gain_a = 20.0;
+
+double min_stddev_x = 0.1;
+double max_stddev_x = 5.0;
+double min_stddev_q = 0.05;
+double max_stddev_q = 0.2;
+double fitness_score_thresh = 0.5;
+
+/**
+ *
+ * @param a
+ * @param max_x
+ * @param min_y
+ * @param max_y
+ * @param x
+ * @return
+ */
+double weight(double a, double max_x, double min_y, double max_y, double x) {
+    double y = (1.0 - std::exp(-a * x)) / (1.0 - std::exp(-a * max_x));
+    return min_y + (max_y - min_y) * y;
+}
+
+
+/**
+ *
+ * @param change
+ * @return
+ */
+Eigen::MatrixXd calc_inf_matrix(Eigen::Isometry3d &noise) {
+    if (use_const_inf) {
+        Eigen::MatrixXd inf = Eigen::MatrixXd::Identity(6, 6);
+        inf.topLeftCorner(3, 3).array() /= const_stddev_x;
+        inf.bottomRightCorner(3, 3).array() /= const_stddev_q;
+        return inf;
+    }
+
+    double fitness_score = 0.0f;
+
+    auto tans = noise.translation();
+
+    fitness_score = sqrt(pow(tans.x(), 2) + pow(tans.y(), 2));
+    //abs(change.second.matrix().eulerAngles(0,1,2).z());
+
+    double min_var_x = std::pow(min_stddev_x, 2);
+    double max_var_x = std::pow(max_stddev_x, 2);
+    double min_var_q = std::pow(min_stddev_q, 2);
+    double max_var_q = std::pow(max_stddev_q, 2);
+
+    double w_x = weight(var_gain_a, fitness_score_thresh, min_var_x, max_var_x, fitness_score);
+    double w_q = weight(var_gain_a, fitness_score_thresh, min_var_q, max_var_q, fitness_score);
+
+    Eigen::MatrixXd inf = Eigen::MatrixXd::Identity(6, 6);
+    inf.topLeftCorner(3, 3).array() /= w_x;
+    inf.bottomRightCorner(3, 3).array() /= w_q;
+    return inf;
+}
+
+
 /**
  * @brief main function
  * 
@@ -371,14 +446,17 @@ int main(int argc, char **argv) {
     ros::NodeHandle nh("~");
 
     // init
-    std::vector<Pose> pose_truth_rb1;  // ground truth rb1
-    std::vector<Pose> pose_truth_rb2;  // ground truth rb2
+    std::vector<Eigen::Isometry3d> pose_truth_rb1;  // ground truth rb1
+    std::vector<Eigen::Isometry3d> pose_truth_rb2;  // ground truth rb2
 
-    std::vector<Pose> pose_real_rb1;  // 实际带噪声的位姿
-    std::vector<Pose> pose_real_rb2;  // 实际带噪声的位姿
+    std::vector<Eigen::Isometry3d> pose_real_rb1;  // 实际带噪声的位姿
+    std::vector<Eigen::Isometry3d> pose_real_rb2;  // 实际带噪声的位姿
 
-    std::vector<Pose> pose_change_n_rb1;  // 带有噪声的位姿变化
-    std::vector<Pose> pose_change_n_rb2;  // 带有噪声的位姿变化
+    std::vector<Eigen::Isometry3d> noise_rb1;      // 噪声 rb1
+    std::vector<Eigen::Isometry3d> noise_rb2;      // 噪声 rb2
+
+    std::vector<Eigen::Isometry3d> pose_change_n_rb1;  // 带有噪声的位姿变化
+    std::vector<Eigen::Isometry3d> pose_change_n_rb2;  // 带有噪声的位姿变化
 
     const unsigned int rb1_node_start = 0;
     const unsigned int rb2_node_start = 10000;
@@ -389,6 +467,32 @@ int main(int argc, char **argv) {
 
     std::vector<SpecialNodes> sp_nodes;  // 容器
 
+    // publishers
+    visualization_msgs::MarkerArray markers; // 显示标记
+    markers.markers.resize(2);               // [0] robot node [1] edges
+    ros::Publisher markers_pub = nh.advertise<visualization_msgs::MarkerArray>("/test_2rb_g2o/markers", 16);
+
+    // 坐标系关系 坐标系变换 已知坐标系关系
+    Eigen::Isometry3d rb2_2_rb1_trans = Eigen::Isometry3d::Identity();
+    // c rb1 3, 1.5, 0, 0, 0, 0
+    // c rb2 4, 0, 0, 0, 0 , pi
+    Eigen::Isometry3d rb1_c = Eigen::Isometry3d::Identity();
+    Eigen::Isometry3d rb2_c = Eigen::Isometry3d::Identity();
+    auto rb1_pose = get_pose(3, 1.5, 0, 0, 0, 0);
+    auto rb2_pose = get_pose(4, 0, 0, 0, 0, 1);
+    rb1_c.prerotate(rb1_pose.second);
+    rb1_c.pretranslate(rb1_pose.first);
+    rb2_c.prerotate(rb2_pose.second);
+    rb2_c.pretranslate(rb2_pose.first);
+    rb2_2_rb1_trans = rb1_c * rb2_c.inverse();
+
+    g2o::RobustKernelFactory *factory = g2o::RobustKernelFactory::instance();
+
+    // 噪声符合的分布
+    const double n_step_rb1 = 0.001, n_yaw_step_rb1 = 0.0005;
+    const double n_step_rb2 = 0.001, n_yaw_step_rb2 = 0.0005;
+
+
     Eigen::Matrix<double, 6, 6> inf;     // 信息矩阵
     inf << 10000, 0, 0, 0, 0, 0,
             0, 10000, 0, 0, 0, 0,
@@ -397,39 +501,16 @@ int main(int argc, char **argv) {
             0, 0, 0, 0, 40000, 0,
             0, 0, 0, 0, 0, 40000;
 
-    // publishers
-    visualization_msgs::MarkerArray markers; // 显示标记
-    markers.markers.resize(2);               // [0] robot node [1] edges
-    ros::Publisher markers_pub = nh.advertise<visualization_msgs::MarkerArray>("/test_2rb_g2o/markers", 16);
-
-    // 坐标系关系 坐标系变换 已知坐标系关系
-    Eigen::Isometry3d rb2_2_rb1_trans = Eigen::Isometry3d::Identity();
-    // c rb1 3, 1.5, 0, 0, 0, -pi
-    // c rb2 4, 0, 0, 0, 0 ,0
-    Eigen::Isometry3d rb2_c = Eigen::Isometry3d::Identity();
-    Eigen::Isometry3d rb1_c = Eigen::Isometry3d::Identity();
-    auto rb1_pose = get_pose(3, 1.5, 0, 0, 0, 1 * PI);
-    auto rb2_pose = get_pose(4, 0, 0, 0, 0, 0);
-    rb1_c.prerotate(rb1_pose.second);
-    rb1_c.pretranslate(rb1_pose.first);
-    rb2_c.prerotate(rb2_pose.second);
-    rb2_c.pretranslate(rb2_pose.first);
-    rb2_2_rb1_trans = rb1_c * rb2_c.inverse();
-
-    g2o::RobustKernelFactory * factory = g2o::RobustKernelFactory::instance();
-
-    // 噪声符合的分布
-    const double n_step_rb1 = 0.001, n_yaw_step_rb1 = 0.01;
-    const double n_step_rb2 = 0.001, n_yaw_step_rb2 = 0.01;
-
     // read data robot 1 2
     std::string data_path_rb1 = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1.txt";
     std::string data_path_rb2 = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r2.txt";
-    if (!get_pose_data(data_path_rb1, pose_truth_rb1, pose_real_rb1, pose_change_n_rb1, n_step_rb1, n_yaw_step_rb1)) {
+    if (!get_pose_data(data_path_rb1, pose_truth_rb1, pose_real_rb1, pose_change_n_rb1, noise_rb1, n_step_rb1,
+                       n_yaw_step_rb1)) {
         ROS_INFO_STREAM("DATA 1 READ ERROR");
         return -1;
     }
-    if (!get_pose_data(data_path_rb2, pose_truth_rb2, pose_real_rb2, pose_change_n_rb2, n_step_rb2, n_yaw_step_rb2)) {
+    if (!get_pose_data(data_path_rb2, pose_truth_rb2, pose_real_rb2, pose_change_n_rb2, noise_rb2, n_step_rb2,
+                       n_yaw_step_rb2)) {
         ROS_INFO_STREAM("DATA 2 READ ERROR");
         return -1;
     }
@@ -445,9 +526,47 @@ int main(int argc, char **argv) {
 
     ROS_INFO_STREAM("loading data ...");
 
-    // robot1 设置节点
+    // robot1 设置节点和边
     int vertexCnt_rb1 = 0, edgeCnt_rb1 = 0;  // 顶点和边的数量
     unsigned int id = rb1_node_start;
+    Eigen::Isometry3d node_pose = Eigen::Isometry3d::Identity();
+    for (int i = 0; i <= pose_change_n_rb1.size(); i++) {
+        VertexSE3LieAlgebra *v = new VertexSE3LieAlgebra();
+        v->setId(id);
+        if (i == 0) {
+            node_pose = pose_truth_rb1[0] * node_pose;
+            v->setFixed(true);
+        } else {
+            node_pose = pose_change_n_rb1[i - 1] * node_pose;
+        }
+        v->setSE3d(Eigen::Quaterniond(node_pose.rotation()), node_pose.translation());
+        vertexCnt_rb1++;
+        vectices.push_back(v);  // 节点存储
+        optimizer.addVertex(v); // 优化器添加节点
+        ROS_INFO_STREAM("add node, id: " << id);
+
+        if (0 != i) {
+            // SE3-SE3 边
+            EdgeSE3LieAlgebra *e = new EdgeSE3LieAlgebra();
+            int idx1 = id - 1, idx2 = id;           // 关联的前后两个顶点
+            edgeCnt_rb1++;
+            e->setId(id);                              // 设置边的id
+            e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点 vertices是map类型
+            e->setVertex(1, optimizer.vertices()[idx2]);
+
+            auto edge_inf = calc_inf_matrix(noise_rb1[i - 1]);
+
+            e->set_edge(Eigen::Quaterniond(pose_change_n_rb1[i - 1].rotation()), pose_change_n_rb1[i - 1].translation(),
+                        edge_inf);
+
+            optimizer.addEdge(e);  // 添加边
+            ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
+            edges.push_back(e);
+        }
+        id++;
+    }
+
+    /*
     for (auto &p: pose_real_rb1) {
         // 顶点
         VertexSE3LieAlgebra *v = new VertexSE3LieAlgebra();
@@ -469,7 +588,57 @@ int main(int argc, char **argv) {
             e->setId(id);                              // 设置边的id
             e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点 vertices是map类型
             e->setVertex(1, optimizer.vertices()[idx2]);
-            e->set_edge(pose_change_n_rb1[id - 1].second, pose_change_n_rb1[id - 1].first, inf);
+
+            auto edge_inf = calc_inf_matrix(noise_rb1[id - 1]);
+
+            e->set_edge(pose_change_n_rb1[id - 1].second, pose_change_n_rb1[id - 1].first, edge_inf);
+
+            optimizer.addEdge(e);  // 添加边
+            ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
+            edges.push_back(e);
+        }
+        id++;
+    }
+    */
+
+    // robot2 设置节点 和边
+    int vertexCnt_rb2 = 0, edgeCnt_rb2 = 0;  // 顶点和边的数量
+    id = rb2_node_start;
+    node_pose = Eigen::Isometry3d::Identity();
+    for (int i = 0; i <= pose_change_n_rb2.size(); i++) {
+        VertexSE3LieAlgebra *v = new VertexSE3LieAlgebra();
+        v->setId(id);
+
+        if (0 == i) {
+            node_pose = pose_truth_rb2[0] * node_pose;
+            v->setFixed(true);
+        } else {
+            node_pose = pose_change_n_rb2[i - 1] * node_pose;
+        }
+
+        // 坐标系转换
+        auto rb2_in_rb1 = rb2_2_rb1_trans * node_pose;
+
+        // 设置节点
+        v->setSE3d(Eigen::Quaterniond(rb2_in_rb1.rotation()), rb2_in_rb1.translation());
+        vertexCnt_rb2++;
+        vectices.push_back(v);  // 节点存储
+        optimizer.addVertex(v); // 优化器添加节点
+        ROS_INFO_STREAM("add node, id: " << id);
+
+        if (0 != i) {
+            // SE3-SE3 边
+            EdgeSE3LieAlgebra *e = new EdgeSE3LieAlgebra();
+            int idx1 = id - 1, idx2 = id;           // 关联的前后两个顶点
+            edgeCnt_rb2++;
+            e->setId(id);                              // 设置边的id
+            e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点 vertices是map类型
+            e->setVertex(1, optimizer.vertices()[idx2]);
+
+            auto edge_inf = calc_inf_matrix(noise_rb2[i - 1]);
+
+            e->set_edge(Eigen::Quaterniond(pose_change_n_rb2[i - 1].rotation()), pose_change_n_rb2[i - 1].translation(),
+                        edge_inf);
 
             optimizer.addEdge(e);  // 添加边
             ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
@@ -478,10 +647,7 @@ int main(int argc, char **argv) {
         id++;
     }
 
-
-    // robot2 设置节点 和边
-    int vertexCnt_rb2 = 0, edgeCnt_rb2 = 0;  // 顶点和边的数量
-    id = rb2_node_start;
+    /*
     for (auto &p: pose_real_rb2) {
         // 顶点
         VertexSE3LieAlgebra *v = new VertexSE3LieAlgebra();
@@ -510,15 +676,19 @@ int main(int argc, char **argv) {
             e->setId(id);                              // 设置边的id
             e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点
             e->setVertex(1, optimizer.vertices()[idx2]);
+
+            auto edge_inf = calc_inf_matrix(noise_rb2[id - rb2_node_start - 1]);
+
             e->set_edge(pose_change_n_rb2[id - rb2_node_start - 1].second,
-                        pose_change_n_rb2[id - rb2_node_start - 1].first, inf);
+                        pose_change_n_rb2[id - rb2_node_start - 1].first, edge_inf);
+
             optimizer.addEdge(e); // 添加边
             ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
             edges.push_back(e);
         }
         id++;
     }
-
+    */
 
     // 回环节点
     std::string data_path_rb1_2_rb2 = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_2_r2.txt";
@@ -536,18 +706,23 @@ int main(int argc, char **argv) {
         idx2 = idx2 + rb2_node_start;
 
         fin >> x >> y >> z >> roll >> pitch >> yaw;
+
         auto temp_pc = get_pose(x, y, z, roll, pitch, yaw);
 
         EdgeSE3LieAlgebra *e = new EdgeSE3LieAlgebra();
         e->setId(id);                                 // 设置边的id
         e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点
         e->setVertex(1, optimizer.vertices()[idx2]);
-        e->set_edge(temp_pc.second, temp_pc.first, inf);
 
-        g2o::RobustKernel* kernel = factory->construct("Huber");
-        if(nullptr == kernel){
+        auto temp_noise = Eigen::Isometry3d::Identity();
+        auto edge_inf = calc_inf_matrix(temp_noise);
+
+        e->set_edge(temp_pc.second, temp_pc.first, edge_inf);
+
+        g2o::RobustKernel *kernel = factory->construct("Huber");
+        if (nullptr == kernel) {
             ROS_INFO_STREAM("kernel error");
-            return - 1;
+            return -1;
         }
         kernel->setDelta(1.0);
 
@@ -561,13 +736,13 @@ int main(int argc, char **argv) {
 
     int i = 1;
     for (auto &node: vectices) {
-        cout << "node ID" << i << " DATA " << node->estimate().translation() << endl
+        cout << "node ID" << i << " DATA " << endl << node->estimate().translation() << endl
              << node->estimate().rotationMatrix().eulerAngles(0, 1, 2) << endl;
         i++;
     }
     i = 1;
     for (auto &edge: edges) {
-        cout << "edge ID" << i << " DATA " << edge->measurement().translation() << endl
+        cout << "edge ID" << i << " DATA " << endl << edge->measurement().translation() << endl
              << edge->measurement().rotationMatrix().eulerAngles(0, 1, 2) << endl;
         i++;
     }
