@@ -46,6 +46,18 @@ typedef std::pair<int, int> SpecialNodes;                     // 特殊节点对
 typedef Matrix<double, 6, 1> Vector6d;                        // 李代数顶点
 #define random(a, b) (rand() % (b - a) + a)
 
+bool use_const_inf = false;
+double const_stddev_x = 0.5;
+double const_stddev_q = 0.1;
+
+double var_gain_a = 20.0;
+
+double min_stddev_x = 0.1;
+double max_stddev_x = 5.0;
+double min_stddev_q = 0.05;
+double max_stddev_q = 0.2;
+double fitness_score_thresh = 0.5;
+
 
 /**
  * @brief Get the pose object返回合适数据结构
@@ -70,20 +82,21 @@ Pose get_pose(double x, double y, double z, double roll, double pitch, double ya
     return Pose(vd, qd);
 }
 
+
 /**
- * @brief Get the pose data object
  *
  * @param file_path
  * @param truth
  * @param real
  * @param pc
+ * @param pc_n
+ * @param noise
  * @param m
  * @param n
- * @return true
- * @return false
+ * @return
  */
 bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth, std::vector<Eigen::Isometry3d> &real,
-                   std::vector<Eigen::Isometry3d> &pc,
+                   std::vector<Eigen::Isometry3d> &pc, std::vector<Eigen::Isometry3d> &pc_n,
                    std::vector<Eigen::Isometry3d> &noise, double m, double n) {
     std::ifstream fin(file_path);
     if (!fin) {
@@ -123,8 +136,10 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
         } else {
             // 本次主要的位姿变化，真实变化
             node_pose_change = Eigen::Isometry3d::Identity();
-            node_pose_change = node_pose_now * (node_pose_before.inverse());
+            node_pose_change = node_pose_before.inverse() * node_pose_now;
+            pc.push_back(node_pose_change);
             // node_pose_change = node_pose_before * node_pose_now.inverse();
+            // B = A * T 在移动坐标系下用右乘 在坐标系间变换下用左乘，此时 T = A-1 × B
 
             // 噪声
             srand((int) time(NULL) + id);                     // 产生随机种子  把0换成NULL也行
@@ -132,8 +147,8 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
             double noise_y = 0;
             double noise_yaw = 0;
             if (node_pose_change.translation().x() != 0 || node_pose_change.translation().y() != 0) {
-                // noise_x = random(-50, 50) * m;
-                // noise_y = random(-50, 50) * m;
+                noise_x = random(-50, 50) * m;
+                noise_y = random(-50, 50) * m;
             }
             if (node_pose_change.rotation().eulerAngles(0, 1, 2).z() != 0) {
                 noise_yaw = random(-50, 50) * n;
@@ -149,13 +164,13 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
             // 带有噪声的变化
 //            ROS_INFO_STREAM("node_pc " << endl << node_pose_change.translation() << endl <<
 //                                       node_pose_change.rotation().eulerAngles(0, 1, 2).z() / PI << endl);
-            node_pc_n = pc_noise * node_pose_change;
-            pc.push_back(node_pc_n);
+            node_pc_n = node_pose_change * pc_noise; // 右乘旋转量
+            pc_n.push_back(node_pc_n);
 //            ROS_INFO_STREAM("node_pc_n " << endl << node_pc_n.translation() << endl <<
 //                                         node_pc_n.rotation().eulerAngles(0, 1, 2).z() / PI << endl);
 
             // 加噪声 累计误差模拟，带误差的变化
-            node_pose_real = node_pc_n * node_pose_real;
+            node_pose_real = node_pose_real * node_pc_n; // 右乘旋转量
             real.push_back(node_pose_real);
 
             node_pose_before = node_pose_now;
@@ -165,19 +180,6 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
 
     return true;
 }
-
-
-bool use_const_inf = false;
-double const_stddev_x = 0.5;
-double const_stddev_q = 0.1;
-
-double var_gain_a = 20.0;
-
-double min_stddev_x = 0.1;
-double max_stddev_x = 5.0;
-double min_stddev_q = 0.05;
-double max_stddev_q = 0.2;
-double fitness_score_thresh = 0.5;
 
 /**
  *
@@ -330,6 +332,9 @@ int main(int argc, char **argv) {
     std::vector<Eigen::Isometry3d> pose_change_n_rb1;  // 带有噪声的位姿变化
     std::vector<Eigen::Isometry3d> pose_change_n_rb2;  // 带有噪声的位姿变化
 
+    std::vector<Eigen::Isometry3d> pose_change_rb1;  // 位姿变化
+    std::vector<Eigen::Isometry3d> pose_change_rb2;  // 位姿变化
+
     std::vector<Eigen::Isometry3d> noise_rb1;      // 噪声 rb1
     std::vector<Eigen::Isometry3d> noise_rb2;      // 噪声 rb2
 
@@ -343,12 +348,12 @@ int main(int argc, char **argv) {
     std::vector<SpecialNodes> sp_nodes;  // 容器
 
     Eigen::Matrix<double, 6, 6> inf;     // 信息矩阵
-    inf << 10000, 0, 0, 0, 0, 0,
-            0, 10000, 0, 0, 0, 0,
-            0, 0, 10000, 0, 0, 0,
-            0, 0, 0, 40000, 0, 0,
-            0, 0, 0, 0, 40000, 0,
-            0, 0, 0, 0, 0, 40000;
+    inf << 100, 0, 0, 0, 0, 0,
+            0, 100, 0, 0, 0, 0,
+            0, 0, 100, 0, 0, 0,
+            0, 0, 0, 400, 0, 0,
+            0, 0, 0, 0, 400, 0,
+            0, 0, 0, 0, 0, 400;
 
     // publishers
     visualization_msgs::MarkerArray markers; // 显示标记
@@ -369,18 +374,36 @@ int main(int argc, char **argv) {
     rb2_c.pretranslate(rb2_pose.first);
     rb2_2_rb1_trans = rb1_c * rb2_c.inverse();
 
-    // 噪声符合的分布
-    const double n_step_rb1 = 0.005, n_yaw_step_rb1 = 0.0005;
-    const double n_step_rb2 = 0.005, n_yaw_step_rb2 = 0.0005;
-
-    // read data robot 1 2
+    // read param
     std::string data_path_rb1 = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1.txt";
     std::string data_path_rb2 = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r2.txt";
-    if (!get_pose_data(data_path_rb1, pose_truth_rb1, pose_real_rb1, pose_change_n_rb1, noise_rb1, n_step_rb1, n_yaw_step_rb1)) {
+    std::string loop_data_path = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_2_r2.txt";
+    double n_step_rb1 = 0.005, n_yaw_step_rb1 = 0.001;    // 噪声符合的分布
+    double n_step_rb2 = 0.005, n_yaw_step_rb2 = 0.001;
+    std::string solver_type = "lm_var_cholmod";
+
+    nh.param("data_path_rb1", data_path_rb1,
+             std::string("/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1.txt"));
+    nh.param("data_path_rb2", data_path_rb2,
+             std::string("/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r2.txt"));
+    nh.param("loop_data_path", loop_data_path,
+             std::string("/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_2_r2.txt"));
+    nh.param("n_step_rb1", n_step_rb1, 0.005);
+    nh.param("n_step_rb2", n_step_rb2, 0.005);
+    nh.param("n_yaw_step_rb1", n_yaw_step_rb1, 0.001);
+    nh.param("n_yaw_step_rb2", n_yaw_step_rb2, 0.001);
+    nh.param("solver_type", solver_type, std::string("lm_var_cholmod"));
+
+    // read data robot 1 2
+    if (!get_pose_data(data_path_rb1, pose_truth_rb1, pose_real_rb1, pose_change_rb1, pose_change_n_rb1, noise_rb1,
+                       n_step_rb1,
+                       n_yaw_step_rb1)) {
         ROS_INFO_STREAM("DATA 1 READ ERROR");
         return -1;
     }
-    if (!get_pose_data(data_path_rb2, pose_truth_rb2, pose_real_rb2, pose_change_n_rb2, noise_rb2, n_step_rb2, n_yaw_step_rb2)) {
+    if (!get_pose_data(data_path_rb2, pose_truth_rb2, pose_real_rb2, pose_change_rb2, pose_change_n_rb2, noise_rb2,
+                       n_step_rb2,
+                       n_yaw_step_rb2)) {
         ROS_INFO_STREAM("DATA 2 READ ERROR");
         return -1;
     }
@@ -399,95 +422,96 @@ int main(int argc, char **argv) {
     // robot1 设置节点
     int vertexCnt_rb1 = 0, edgeCnt_rb1 = 0;  // 顶点和边的数量
     unsigned int id = rb1_node_start;
-    for (auto &p: pose_real_rb1) {
-        // 顶点
-        g2o::VertexSE3 *v = new g2o::VertexSE3();
-        v->setId(id);
-        v->setEstimate(p);
+    if (!pose_change_rb1.empty())
+        for (auto &p: pose_real_rb1) {
+            // 顶点
+            g2o::VertexSE3 *v = new g2o::VertexSE3();
+            v->setId(id);
+            v->setEstimate(p);
 
-        optimizer.addVertex(v); // 优化器添加节点
+            optimizer.addVertex(v); // 优化器添加节点
 
-        ROS_INFO_STREAM("add node, id: " << id);
-        vertexCnt_rb1++;
-        vectices.push_back(v);  // 节点存储
+            ROS_INFO_STREAM("add node, id: " << id);
+            vertexCnt_rb1++;
+            vectices.push_back(v);  // 节点存储
 
-        // 设置边
-        if (0 == id) {  // 以机器人一的坐标系为基准
-            v->setFixed(true);
-        } else {
-            // SE3-SE3 边
-            g2o::EdgeSE3 *e = new g2o::EdgeSE3();
-            int idx1 = id - 1, idx2 = id;           // 关联的前后两个顶点
-            edgeCnt_rb1++;
-            e->setId(id);                              // 设置边的id
-            e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点 vertices是map类型
-            e->setVertex(1, optimizer.vertices()[idx2]);
-            e->setMeasurement(pose_change_n_rb1[id - 1]);
+            // 设置边
+            if (0 == id) {  // 以机器人一的坐标系为基准
+                v->setFixed(true);
+            } else {
+                // SE3-SE3 边
+                g2o::EdgeSE3 *e = new g2o::EdgeSE3();
+                int idx1 = id - 1, idx2 = id;           // 关联的前后两个顶点
+                edgeCnt_rb1++;
+                e->setId(id);                              // 设置边的id
+                e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点 vertices是map类型
+                e->setVertex(1, optimizer.vertices()[idx2]);
+                e->setMeasurement(pose_change_rb1[id - 1]);
 
-            auto edge_inf = calc_inf_matrix(noise_rb1[id - 1]);
+                auto edge_inf = calc_inf_matrix(noise_rb1[id - 1]);
 
-            e->setInformation(edge_inf);
+                e->setInformation(inf);
 
-            optimizer.addEdge(e);  // 添加边
+                optimizer.addEdge(e);  // 添加边
 
-            ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
-            edges.push_back(e);
+                ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
+                edges.push_back(e);
+            }
+            id++;
         }
-        id++;
-    }
 
 
     // robot2 设置节点 和边
     int vertexCnt_rb2 = 0, edgeCnt_rb2 = 0;  // 顶点和边的数量
     id = rb2_node_start;
-    for (auto &p: pose_real_rb2) {
-        // 顶点
-        g2o::VertexSE3 *v = new g2o::VertexSE3();
-        v->setId(id);
+    if (!pose_change_rb2.empty())
+        for (auto &p: pose_real_rb2) {
+            // 顶点
+            g2o::VertexSE3 *v = new g2o::VertexSE3();
+            v->setId(id);
 
-        // 坐标系转换
-        auto rb2_in_rb1 = rb2_2_rb1_trans * p; // rb2_2_rb1_trans
+            // 坐标系转换
+            auto rb2_in_rb1 = rb2_2_rb1_trans * p; // rb2_2_rb1_trans
 
-        // 设置节点
-        v->setEstimate(rb2_in_rb1);
+            // 设置节点
+            v->setEstimate(rb2_in_rb1);
 
-        optimizer.addVertex(v);
+            optimizer.addVertex(v);
 
-        ROS_INFO_STREAM("add node, id: " << id);
-        vertexCnt_rb2++;
-        vectices.push_back(v);
+            ROS_INFO_STREAM("add node, id: " << id);
+            vertexCnt_rb2++;
+            vectices.push_back(v);
 
-        // SE3-SE3 边 从10001开始
-        if (rb2_node_start == id) {  // 以机器人一的坐标系为基准
-            v->setFixed(true);
-        } else {
-            // SE3-SE3 边
-            g2o::EdgeSE3 *e = new g2o::EdgeSE3();
-            int idx1 = id - 1, idx2 = id;           // 关联的前后两个顶点
-            edgeCnt_rb2++;
-            e->setId(id);                              // 设置边的id
-            e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点
-            e->setVertex(1, optimizer.vertices()[idx2]);
-            e->setMeasurement(pose_change_n_rb2[id - rb2_node_start - 1]);
+            // SE3-SE3 边 从10001开始
+            if (rb2_node_start == id) {  // 以机器人一的坐标系为基准
+                v->setFixed(true);
+            } else {
+                // SE3-SE3 边
+                g2o::EdgeSE3 *e = new g2o::EdgeSE3();
+                int idx1 = id - 1, idx2 = id;           // 关联的前后两个顶点
+                edgeCnt_rb2++;
+                e->setId(id);                              // 设置边的id
+                e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点
+                e->setVertex(1, optimizer.vertices()[idx2]);
+                e->setMeasurement(pose_change_rb2[id - rb2_node_start - 1]);
 
-            auto edge_inf = calc_inf_matrix(noise_rb2[id - rb2_node_start - 1]);
+                auto edge_inf = calc_inf_matrix(noise_rb2[id - rb2_node_start - 1]);
 
-            e->setInformation(edge_inf);
+                e->setInformation(inf);
 
-            optimizer.addEdge(e); // 添加边
+                optimizer.addEdge(e); // 添加边
 
-            ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
-            edges.push_back(e);
+                ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
+                edges.push_back(e);
+            }
+            id++;
         }
-        id++;
-    }
 
 
     // 回环节点
-    std::string data_path_rb1_2_rb2 = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_2_r2.txt";
-    std::ifstream fin(data_path_rb1_2_rb2);
+    std::ifstream fin(loop_data_path);
     if (!fin) {
-        ROS_INFO_STREAM("file " << data_path_rb1_2_rb2 << " does not exist.");
+        ROS_INFO_STREAM("file " << loop_data_path << " does not exist.");
         return -1;
     }
     unsigned int idx1 = 0, idx2 = 0;
@@ -495,11 +519,7 @@ int main(int argc, char **argv) {
     id = sp_edge_start;
     while (!fin.eof()) {
         fin >> idx1 >> idx2;
-        idx1 = idx1 + rb1_node_start;
-        idx2 = idx2 + rb2_node_start;
-
         fin >> x >> y >> z >> roll >> pitch >> yaw;
-
         auto temp_pc = get_pose(x, y, z, roll, pitch, yaw);
 
         // SE3-SE3 边
@@ -516,7 +536,7 @@ int main(int argc, char **argv) {
         auto temp_noise = Eigen::Isometry3d::Identity();
         auto edge_inf = calc_inf_matrix(temp_noise);
 
-        e->setInformation(edge_inf);
+        e->setInformation(inf);
 
         optimizer.addEdge(e);  // 添加边
 
@@ -537,7 +557,6 @@ int main(int argc, char **argv) {
              << edge->measurement().rotation().eulerAngles(0, 1, 2) << endl;
         i++;
     }
-
 
     // show
     ROS_INFO_STREAM("robot 1 " << vertexCnt_rb1 << " vertices, " << edgeCnt_rb1 << " edges.");

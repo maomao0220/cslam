@@ -34,6 +34,10 @@
 #include <g2o/core/hyper_graph.h>
 #include <g2o/core/robust_kernel.h>
 #include <g2o/core/robust_kernel_factory.h>
+#include <g2o/core/optimization_algorithm.h>
+#include <g2o/core/optimization_algorithm_factory.h>
+#include <g2o/core/optimization_algorithm_gauss_newton.h>
+#include <g2o/core/optimization_algorithm_dogleg.h>
 
 #include <sophus/se3.hpp>
 
@@ -158,7 +162,7 @@ public:
     virtual void computeError() override {
         SE3d v1 = (static_cast<VertexSE3LieAlgebra *>(_vertices[0]))->estimate();
         SE3d v2 = (static_cast<VertexSE3LieAlgebra *>(_vertices[1]))->estimate();
-        _error = (_measurement.inverse()* v2 * v1.inverse()).log();
+        _error = (_measurement.inverse() * v1.inverse() * v2).log();
     }
 
     // 雅可比计算
@@ -208,7 +212,7 @@ Pose get_pose(double x, double y, double z, double roll, double pitch, double ya
  * @return false 
  */
 bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth, std::vector<Eigen::Isometry3d> &real,
-                   std::vector<Eigen::Isometry3d> &pc,
+                   std::vector<Eigen::Isometry3d> &pc, std::vector<Eigen::Isometry3d> &pc_n,
                    std::vector<Eigen::Isometry3d> &noise, double m, double n) {
     std::ifstream fin(file_path);
     if (!fin) {
@@ -248,8 +252,10 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
         } else {
             // 本次主要的位姿变化，真实变化
             node_pose_change = Eigen::Isometry3d::Identity();
-            node_pose_change = node_pose_now * (node_pose_before.inverse());
+            node_pose_change = node_pose_before.inverse() * node_pose_now;
+            pc.push_back(node_pose_change);
             // node_pose_change = node_pose_before * node_pose_now.inverse();
+            // B = A * T 在移动坐标系下用右乘 在坐标系间变换下用左乘，此时 T = A-1 × B
 
             // 噪声
             srand((int) time(NULL) + id);                     // 产生随机种子  把0换成NULL也行
@@ -257,8 +263,8 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
             double noise_y = 0;
             double noise_yaw = 0;
             if (node_pose_change.translation().x() != 0 || node_pose_change.translation().y() != 0) {
-                // noise_x = random(-50, 50) * m;
-                // noise_y = random(-50, 50) * m;
+                noise_x = random(-50, 50) * m;
+                noise_y = random(-50, 50) * m;
             }
             if (node_pose_change.rotation().eulerAngles(0, 1, 2).z() != 0) {
                 noise_yaw = random(-50, 50) * n;
@@ -274,13 +280,13 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
             // 带有噪声的变化
 //            ROS_INFO_STREAM("node_pc " << endl << node_pose_change.translation() << endl <<
 //                                       node_pose_change.rotation().eulerAngles(0, 1, 2).z() / PI << endl);
-            node_pc_n = pc_noise * node_pose_change;
-            pc.push_back(node_pc_n);
+            node_pc_n = node_pose_change * pc_noise; // 右乘旋转量
+            pc_n.push_back(node_pc_n);
 //            ROS_INFO_STREAM("node_pc_n " << endl << node_pc_n.translation() << endl <<
 //                                         node_pc_n.rotation().eulerAngles(0, 1, 2).z() / PI << endl);
 
             // 加噪声 累计误差模拟，带误差的变化
-            node_pose_real = node_pc_n * node_pose_real;
+            node_pose_real = node_pose_real * node_pc_n; // 右乘旋转量
             real.push_back(node_pose_real);
 
             node_pose_before = node_pose_now;
@@ -458,6 +464,9 @@ int main(int argc, char **argv) {
     std::vector<Eigen::Isometry3d> pose_change_n_rb1;  // 带有噪声的位姿变化
     std::vector<Eigen::Isometry3d> pose_change_n_rb2;  // 带有噪声的位姿变化
 
+    std::vector<Eigen::Isometry3d> pose_change_rb1;  // 位姿变化
+    std::vector<Eigen::Isometry3d> pose_change_rb2;  // 位姿变化
+
     const unsigned int rb1_node_start = 0;
     const unsigned int rb2_node_start = 10000;
     const unsigned int sp_edge_start = 20000;
@@ -486,30 +495,46 @@ int main(int argc, char **argv) {
     rb2_c.pretranslate(rb2_pose.first);
     rb2_2_rb1_trans = rb1_c * rb2_c.inverse();
 
+    // g2o kernel
     g2o::RobustKernelFactory *factory = g2o::RobustKernelFactory::instance();
 
-    // 噪声符合的分布
-    const double n_step_rb1 = 0.001, n_yaw_step_rb1 = 0.0005;
-    const double n_step_rb2 = 0.001, n_yaw_step_rb2 = 0.0005;
-
-
     Eigen::Matrix<double, 6, 6> inf;     // 信息矩阵
-    inf << 10000, 0, 0, 0, 0, 0,
-            0, 10000, 0, 0, 0, 0,
-            0, 0, 10000, 0, 0, 0,
-            0, 0, 0, 40000, 0, 0,
-            0, 0, 0, 0, 40000, 0,
-            0, 0, 0, 0, 0, 40000;
+    inf << 100, 0, 0, 0, 0, 0,
+            0, 100, 0, 0, 0, 0,
+            0, 0, 100, 0, 0, 0,
+            0, 0, 0, 100, 0, 0,
+            0, 0, 0, 0, 100, 0,
+            0, 0, 0, 0, 0, 100;
 
-    // read data robot 1 2
+    // read param
     std::string data_path_rb1 = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1.txt";
     std::string data_path_rb2 = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r2.txt";
-    if (!get_pose_data(data_path_rb1, pose_truth_rb1, pose_real_rb1, pose_change_n_rb1, noise_rb1, n_step_rb1,
+    std::string loop_data_path = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_2_r2.txt";
+    double n_step_rb1 = 0.005, n_yaw_step_rb1 = 0.001;    // 噪声符合的分布
+    double n_step_rb2 = 0.005, n_yaw_step_rb2 = 0.001;
+    std::string solver_type = "lm_var_cholmod";
+
+    nh.param("data_path_rb1", data_path_rb1,
+             std::string("/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1.txt"));
+    nh.param("data_path_rb2", data_path_rb2,
+             std::string("/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r2.txt"));
+    nh.param("loop_data_path", loop_data_path,
+             std::string("/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_2_r2.txt"));
+    nh.param("n_step_rb1", n_step_rb1, 0.005);
+    nh.param("n_step_rb2", n_step_rb2, 0.005);
+    nh.param("n_yaw_step_rb1", n_yaw_step_rb1, 0.001);
+    nh.param("n_yaw_step_rb2", n_yaw_step_rb2, 0.001);
+    nh.param("solver_type", solver_type, std::string("lm_var_cholmod"));
+
+    // read data
+    if (!get_pose_data(data_path_rb1, pose_truth_rb1, pose_real_rb1, pose_change_rb1, pose_change_n_rb1, noise_rb1,
+                       n_step_rb1,
                        n_yaw_step_rb1)) {
         ROS_INFO_STREAM("DATA 1 READ ERROR");
         return -1;
     }
-    if (!get_pose_data(data_path_rb2, pose_truth_rb2, pose_real_rb2, pose_change_n_rb2, noise_rb2, n_step_rb2,
+    if (!get_pose_data(data_path_rb2, pose_truth_rb2, pose_real_rb2, pose_change_rb2, pose_change_n_rb2, noise_rb2,
+                       n_step_rb2,
                        n_yaw_step_rb2)) {
         ROS_INFO_STREAM("DATA 2 READ ERROR");
         return -1;
@@ -518,11 +543,21 @@ int main(int argc, char **argv) {
     // 设定g2o
     typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 6>> BlockSolverType;            // 每个误差项的优化变量维度为6,误差值维度为6
     typedef g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType> LinearSolverType;  // 线性求解器类型
-    auto solver = new g2o::OptimizationAlgorithmLevenberg(                             // 梯度下降方法 可以选择高斯牛顿、LM、DogLeg
+    auto solver = new g2o::OptimizationAlgorithmGaussNewton(                            // 梯度下降方法 可以选择高斯牛顿、LM、DogLeg
             g2o::make_unique<BlockSolverType>(g2o::make_unique<LinearSolverType>()));
     g2o::SparseOptimizer optimizer;  // 图模型
     optimizer.setAlgorithm(solver);  // 设置求解器
     optimizer.setVerbose(true);      // 打开调试输出
+
+//    std::unique_ptr<g2o::HyperGraph> graph;
+//    graph.reset(new g2o::SparseOptimizer());
+//    g2o::SparseOptimizer* optimizer = dynamic_cast<g2o::SparseOptimizer*>(graph.get());
+//    g2o::OptimizationAlgorithmFactory * solver_factory = g2o::OptimizationAlgorithmFactory::instance();
+//    g2o::OptimizationAlgorithmProperty solver_property;
+//    g2o::OptimizationAlgorithm* solver = solver_factory->construct(solver_type, solver_property);
+//    optimizer->setAlgorithm(solver);
+//    optimizer->setVerbose(true);
+
 
     ROS_INFO_STREAM("loading data ...");
 
@@ -530,14 +565,15 @@ int main(int argc, char **argv) {
     int vertexCnt_rb1 = 0, edgeCnt_rb1 = 0;  // 顶点和边的数量
     unsigned int id = rb1_node_start;
     Eigen::Isometry3d node_pose = Eigen::Isometry3d::Identity();
+    if(!pose_change_n_rb1.empty())
     for (int i = 0; i <= pose_change_n_rb1.size(); i++) {
         VertexSE3LieAlgebra *v = new VertexSE3LieAlgebra();
         v->setId(id);
         if (i == 0) {
-            node_pose = pose_truth_rb1[0] * node_pose;
+            node_pose = node_pose * pose_truth_rb1[0];
             v->setFixed(true);
         } else {
-            node_pose = pose_change_n_rb1[i - 1] * node_pose;
+            node_pose = node_pose * pose_change_n_rb1[i - 1];
         }
         v->setSE3d(Eigen::Quaterniond(node_pose.rotation()), node_pose.translation());
         vertexCnt_rb1++;
@@ -556,8 +592,8 @@ int main(int argc, char **argv) {
 
             auto edge_inf = calc_inf_matrix(noise_rb1[i - 1]);
 
-            e->set_edge(Eigen::Quaterniond(pose_change_n_rb1[i - 1].rotation()), pose_change_n_rb1[i - 1].translation(),
-                        edge_inf);
+            e->set_edge(Eigen::Quaterniond(pose_change_rb1[i - 1].rotation()), pose_change_rb1[i - 1].translation(),
+                        inf);
 
             optimizer.addEdge(e);  // 添加边
             ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
@@ -605,19 +641,20 @@ int main(int argc, char **argv) {
     int vertexCnt_rb2 = 0, edgeCnt_rb2 = 0;  // 顶点和边的数量
     id = rb2_node_start;
     node_pose = Eigen::Isometry3d::Identity();
+    if(!pose_change_n_rb2.empty())
     for (int i = 0; i <= pose_change_n_rb2.size(); i++) {
         VertexSE3LieAlgebra *v = new VertexSE3LieAlgebra();
         v->setId(id);
 
         if (0 == i) {
-            node_pose = pose_truth_rb2[0] * node_pose;
+            node_pose = node_pose * pose_truth_rb2[0]; // 移动坐标系下右乘
             v->setFixed(true);
         } else {
-            node_pose = pose_change_n_rb2[i - 1] * node_pose;
+            node_pose = node_pose * pose_change_n_rb2[i - 1]; // 移动坐标系下右乘
         }
 
         // 坐标系转换
-        auto rb2_in_rb1 = rb2_2_rb1_trans * node_pose;
+        auto rb2_in_rb1 = rb2_2_rb1_trans * node_pose; // 坐标系间转换 左乘旋转矩阵
 
         // 设置节点
         v->setSE3d(Eigen::Quaterniond(rb2_in_rb1.rotation()), rb2_in_rb1.translation());
@@ -637,8 +674,8 @@ int main(int argc, char **argv) {
 
             auto edge_inf = calc_inf_matrix(noise_rb2[i - 1]);
 
-            e->set_edge(Eigen::Quaterniond(pose_change_n_rb2[i - 1].rotation()), pose_change_n_rb2[i - 1].translation(),
-                        edge_inf);
+            e->set_edge(Eigen::Quaterniond(pose_change_rb2[i - 1].rotation()), pose_change_rb2[i - 1].translation(),
+                        inf);
 
             optimizer.addEdge(e);  // 添加边
             ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
@@ -691,10 +728,9 @@ int main(int argc, char **argv) {
     */
 
     // 回环节点
-    std::string data_path_rb1_2_rb2 = "/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_2_r2.txt";
-    std::ifstream fin(data_path_rb1_2_rb2);
+    std::ifstream fin(loop_data_path);
     if (!fin) {
-        ROS_INFO_STREAM("file " << data_path_rb1_2_rb2 << " does not exist.");
+        ROS_INFO_STREAM("file " << loop_data_path << " does not exist.");
         return -1;
     }
     unsigned int idx1 = 0, idx2 = 0;
@@ -702,8 +738,6 @@ int main(int argc, char **argv) {
     id = sp_edge_start;
     while (!fin.eof()) {
         fin >> idx1 >> idx2;
-        idx1 = idx1 + rb1_node_start;
-        idx2 = idx2 + rb2_node_start;
 
         fin >> x >> y >> z >> roll >> pitch >> yaw;
 
@@ -717,7 +751,7 @@ int main(int argc, char **argv) {
         auto temp_noise = Eigen::Isometry3d::Identity();
         auto edge_inf = calc_inf_matrix(temp_noise);
 
-        e->set_edge(temp_pc.second, temp_pc.first, edge_inf);
+        e->set_edge(temp_pc.second, temp_pc.first, inf);
 
         g2o::RobustKernel *kernel = factory->construct("Huber");
         if (nullptr == kernel) {
@@ -726,7 +760,7 @@ int main(int argc, char **argv) {
         }
         kernel->setDelta(1.0);
 
-        e->setRobustKernel(kernel);
+        // e->setRobustKernel(kernel);
 
         optimizer.addEdge(e);  // 添加边
         ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
@@ -734,18 +768,18 @@ int main(int argc, char **argv) {
         id++;
     }
 
-    int i = 1;
-    for (auto &node: vectices) {
-        cout << "node ID" << i << " DATA " << endl << node->estimate().translation() << endl
-             << node->estimate().rotationMatrix().eulerAngles(0, 1, 2) << endl;
-        i++;
-    }
-    i = 1;
-    for (auto &edge: edges) {
-        cout << "edge ID" << i << " DATA " << endl << edge->measurement().translation() << endl
-             << edge->measurement().rotationMatrix().eulerAngles(0, 1, 2) << endl;
-        i++;
-    }
+//    int i = 1;
+//    for (auto &node: vectices) {
+//        cout << "node ID" << i << " DATA " << endl << node->estimate().translation() << endl
+//             << node->estimate().rotationMatrix().eulerAngles(0, 1, 2) << endl;
+//        i++;
+//    }
+//    i = 1;
+//    for (auto &edge: edges) {
+//        cout << "edge ID" << i << " DATA " << endl << edge->measurement().translation() << endl
+//             << edge->measurement().rotationMatrix().eulerAngles(0, 1, 2) << endl;
+//        i++;
+//    }
 
 
     // show

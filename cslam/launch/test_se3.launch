@@ -5,7 +5,24 @@
     <param name="use_sim_time" value="true" />
 
     <!-- node -->
+<!--     <node pkg="cslam" type="test_algorithm_se3" name="test_algorithm" output="screen"> -->
+<!--         <param name="data_path_rb1" value="/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_test.txt"/> -->
+<!--         <param name="data_path_rb2" value="/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r2_test.txt"/> -->
+<!--         <param name="loop_data_path" value="/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_2_r2_test.txt"/> -->
+<!--         <param name="n_step_rb1" value="0.005"/> -->
+<!--         <param name="n_step_rb2" value="0.005"/> -->
+<!--         <param name="n_yaw_step_rb1" value="0.001"/> -->
+<!--         <param name="n_yaw_step_rb2" value="0.001"/> -->
+<!--     </node> -->
+
     <node pkg="cslam" type="test_algorithm_se3" name="test_algorithm" output="screen">
+        <param name="data_path_rb1" value="/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1.txt"/>
+        <param name="data_path_rb2" value="/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r2.txt"/>
+        <param name="loop_data_path" value="/home/a2021-3/catkin_ws_cslam/src/cslam/src/cslam/test_data_r1_2_r2.txt"/>
+        <param name="n_step_rb1" value="0.005"/>
+        <param name="n_step_rb2" value="0.005"/>
+        <param name="n_yaw_step_rb1" value="0.001"/>
+        <param name="n_yaw_step_rb2" value="0.001"/>
     </node>
 
     <!-- rviz -->
