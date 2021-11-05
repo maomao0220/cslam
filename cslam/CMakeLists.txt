@@ -99,3 +99,23 @@ target_link_libraries(test_algorithm_se3
         ${CHOLMOD_LIBRARIES}
         )
 
+add_executable(test_algorithm_lie src/cslam/test_lie.cpp)
+target_link_libraries(test_algorithm_lie
+        ${catkin_LIBRARIES}
+        ${PCL_LIBRARIES}
+        g2o_core
+        g2o_stuff
+        g2o_types_slam3d glog::glog
+        ${CHOLMOD_LIBRARIES}
+        )
+
+add_executable(test_algorithm_killian src/cslam/test_algorithm_killian.cpp)
+target_link_libraries(test_algorithm_killian
+        ${catkin_LIBRARIES}
+        ${PCL_LIBRARIES}
+        g2o_core
+        g2o_stuff
+        g2o_types_slam3d glog::glog
+        ${CHOLMOD_LIBRARIES}
+        )
+

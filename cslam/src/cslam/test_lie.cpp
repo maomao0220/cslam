@@ -2,14 +2,13 @@
  * @file test_algorithm_se3.cpp
  * @author RJY (renjingyuan@whut.edu.cn)
  * @brief 测试多机器人图优化方法
- * @version 0.5
- * @date 2021-11-05
+ * @version 0.2
+ * @date 2021-11-01
  * 
  * @copyright Copyright (c) 2021
  * 
  */
 
-// standard lib
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -19,16 +18,13 @@
 #include <random>
 #include <string>
 
-// ros lib
 #include <ros/ros.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <boost/thread/thread.hpp>
 
-// Eigen lib
 #include <Eigen/Core>
 
-// G2O lib
 #include <g2o/core/base_binary_edge.h>
 #include <g2o/core/base_vertex.h>
 #include <g2o/core/block_solver.h>
@@ -36,26 +32,29 @@
 #include <g2o/solvers/eigen/linear_solver_eigen.h>
 #include <g2o/types/slam3d/types_slam3d.h>
 
-// sophus lib
 #include <sophus/se3.hpp>
 
 using namespace std;
 using namespace Eigen;
 using namespace ros;
 
+using Sophus::SE3d;
+using Sophus::SO3d;
+
 #define PI (3.1415926535897932346f)
-#define random(a, b) (rand() % (b - a) + a)
 
 typedef Matrix<double, 6, 6> Matrix6d;
 typedef std::pair<Eigen::Vector3d, Eigen::Quaterniond> Pose;  // 位姿对
 typedef std::pair<int, int> SpecialNodes;                     // 特殊节点对
 typedef Matrix<double, 6, 1> Vector6d;                        // 李代数顶点
-
+#define random(a, b) (rand() % (b - a) + a)
 
 bool use_const_inf = false;
 double const_stddev_x = 0.5;
 double const_stddev_q = 0.1;
+
 double var_gain_a = 20.0;
+
 double min_stddev_x = 0.1;
 double max_stddev_x = 5.0;
 double min_stddev_q = 0.05;
@@ -63,8 +62,132 @@ double max_stddev_q = 0.2;
 double fitness_score_thresh = 0.5;
 
 
+// 给定误差求J_R^{-1}的近似
+Matrix6d JRInv(const SE3d &e) {
+    Matrix6d J;
+    J.block(0, 0, 3, 3) = SO3d::hat(e.so3().log());
+    J.block(0, 3, 3, 3) = SO3d::hat(e.translation());
+    J.block(3, 0, 3, 3) = Matrix3d::Zero(3, 3);
+    J.block(3, 3, 3, 3) = SO3d::hat(e.so3().log());
+    // J = J * 0.5 + Matrix6d::Identity();
+    // J = Matrix6d::Identity();  // try Identity if you want
+    return J;
+}
+
 /**
- * @brief 转化x y z roll pitch yaw 到 Pose数据类型
+ * @brief g2o顶点
+ *
+ */
+class VertexSE3LieAlgebra : public g2o::BaseVertex<6, SE3d> {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    virtual bool read(istream &is) override {
+        double data[7];
+        for (int i = 0; i < 7; i++)
+            is >> data[i];
+        setEstimate(SE3d(
+                Quaterniond(data[6], data[3], data[4], data[5]),
+                Vector3d(data[0], data[1], data[2])));
+    }
+
+    virtual bool write(ostream &os) const override {
+        os << id() << " ";
+        Quaterniond q = _estimate.unit_quaternion();
+        os << _estimate.translation().transpose() << " ";
+        os << q.coeffs()[0] << " " << q.coeffs()[1] << " " << q.coeffs()[2] << " " << q.coeffs()[3] << endl;
+        return true;
+    }
+
+    virtual void setToOriginImpl() override {
+        _estimate = SE3d();
+    }
+
+    // 左乘更新
+    virtual void oplusImpl(const double *update) override {
+        Vector6d upd;
+        upd << update[0], update[1], update[2], update[3], update[4], update[5];
+        _estimate = SE3d::exp(upd) * _estimate;
+    }
+
+    void set_node(Eigen::Isometry3d & p) {
+        Quaterniond q(p.rotation());
+        q.normalize();
+        setEstimate(SE3d(q, p.translation()));
+    }
+};
+
+/**
+ * @brief g2o边
+ * VertexSE3LieAlgebra节点类型
+ */
+class EdgeSE3LieAlgebra : public g2o::BaseBinaryEdge<6, SE3d, VertexSE3LieAlgebra, VertexSE3LieAlgebra> {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    virtual bool read(istream &is) override {
+        double data[7];
+        for (int i = 0; i < 7; i++)
+            is >> data[i];
+        Quaterniond q(data[6], data[3], data[4], data[5]);
+        q.normalize();
+        setMeasurement(SE3d(q, Vector3d(data[0], data[1], data[2])));
+        for (int i = 0; i < information().rows() && is.good(); i++)
+            for (int j = i; j < information().cols() && is.good(); j++) {
+                is >> information()(i, j);
+                if (i != j)
+                    information()(j, i) = information()(i, j);
+            }
+        return true;
+    }
+
+    bool set_edge(Eigen::Isometry3d & p, const Matrix6d &inf) {
+        Quaterniond q(p.rotation());
+        q.normalize();
+        setMeasurement(SE3d(q, p.translation()));
+        this->setInformation(inf);
+        return true;
+    }
+
+    virtual bool write(ostream &os) const override {
+        VertexSE3LieAlgebra *v1 = static_cast<VertexSE3LieAlgebra *>(_vertices[0]);
+        VertexSE3LieAlgebra *v2 = static_cast<VertexSE3LieAlgebra *>(_vertices[1]);
+        os << v1->id() << " " << v2->id() << " ";
+        SE3d m = _measurement;
+        Eigen::Quaterniond q = m.unit_quaternion();
+        os << m.translation().transpose() << " ";
+        os << q.coeffs()[0] << " " << q.coeffs()[1] << " " << q.coeffs()[2] << " " << q.coeffs()[3] << " ";
+
+        // information matrix
+        for (int i = 0; i < information().rows(); i++)
+            for (int j = i; j < information().cols(); j++) {
+                os << information()(i, j) << " ";
+            }
+        os << endl;
+        return true;
+    }
+
+    // 误差计算与书中推导一致
+    virtual void computeError() override {
+        SE3d v1 = (static_cast<VertexSE3LieAlgebra *>(_vertices[0]))->estimate();
+        SE3d v2 = (static_cast<VertexSE3LieAlgebra *>(_vertices[1]))->estimate();
+        _error = (_measurement.inverse() * v1.inverse() * v2).log();
+    }
+
+    // 雅可比计算
+    virtual void linearizeOplus() override {
+        SE3d v1 = (static_cast<VertexSE3LieAlgebra *>(_vertices[0]))->estimate();
+        SE3d v2 = (static_cast<VertexSE3LieAlgebra *>(_vertices[1]))->estimate();
+        Matrix6d J = JRInv(SE3d::exp(_error));
+        // 尝试把J近似为I？
+        _jacobianOplusXi = -J * v2.inverse().Adj();
+        _jacobianOplusXj = J * v2.inverse().Adj();
+    }
+};
+
+
+/**
+ * @brief Get the pose object返回合适数据结构
  * 
  * @param x 
  * @param y 
@@ -72,7 +195,7 @@ double fitness_score_thresh = 0.5;
  * @param roll 
  * @param pitch 
  * @param yaw 
- * @return Pose 
+ * @return Pose  逆时针旋转为正
  */
 Pose get_pose(double x, double y, double z, double roll, double pitch, double yaw) {
     Eigen::AngleAxisd rollAngle(PI * roll, Vector3d(1, 0, 0));
@@ -88,18 +211,16 @@ Pose get_pose(double x, double y, double z, double roll, double pitch, double ya
 
 
 /**
- * @brief 从文件读取特定格式的位姿数据
- * 
- * @param file_path 数据文件路径
- * @param truth 位姿真值
- * @param real 带噪声的实际位姿
- * @param pc 位姿变化真值
- * @param pc_n 带噪声的位姿变化
- * @param noise 位姿变化的噪声
- * @param m 噪声调节参数
- * @param n 噪声调节参数
- * @return true 读取数据成功
- * @return false 读取数据失败
+ *
+ * @param file_path
+ * @param truth
+ * @param real
+ * @param pc
+ * @param pc_n
+ * @param noise
+ * @param m
+ * @param n
+ * @return
  */
 bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth, std::vector<Eigen::Isometry3d> &real,
                    std::vector<Eigen::Isometry3d> &pc, std::vector<Eigen::Isometry3d> &pc_n,
@@ -110,8 +231,7 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
         return false;
     }
 
-    static unsigned int temp_seed = 0;
-    bool first = true;
+    unsigned int id = 0;
     double x = 0, y = 0, z = 0, roll = 0, pitch = 0, yaw = 0;
 
     Eigen::Isometry3d node_pose_before = Eigen::Isometry3d::Identity(); // 之前的真实位姿
@@ -121,11 +241,11 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
     Eigen::Isometry3d node_pc_n = Eigen::Isometry3d::Identity();        // 测量位姿变化带噪声
     Eigen::Isometry3d pc_noise = Eigen::Isometry3d::Identity();         // 位姿噪声
 
-    // temp_seed = 0;
+    id = 0;
     while (!fin.eof()) {
         fin >> x >> y >> z >> roll >> pitch >> yaw;
 
-        temp_seed++;  // 节点id
+        id++;  // 节点id
         auto temp = get_pose(x, y, z, roll, pitch, yaw);
 
         node_pose_now = Eigen::Isometry3d::Identity();
@@ -136,11 +256,10 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
         truth.push_back(node_pose_now);  // 添加机器人1的位置真值
 
         // 添加机器人1带噪声的位姿
-        if (first) {
+        if (1 == id) {
             // 初始化 应该都为单位阵
             node_pose_before = node_pose_now;
             real.push_back(node_pose_now);  // 初始点不带噪声
-            first = false;
         } else {
             // 本次主要的位姿变化，真实变化
             node_pose_change = Eigen::Isometry3d::Identity();
@@ -150,7 +269,7 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
             // B = A * T 在移动坐标系下用右乘 在坐标系间变换下用左乘，此时 T = A-1 × B
 
             // 噪声
-            srand(time(NULL) + temp_seed);                     // 产生随机种子  把0换成NULL也行
+            srand((int) time(NULL) + id);                     // 产生随机种子  把0换成NULL也行
             double noise_x = 0;
             double noise_y = 0;
             double noise_yaw = 0;
@@ -183,23 +302,20 @@ bool get_pose_data(std::string &file_path, std::vector<Eigen::Isometry3d> &truth
 
             node_pose_before = node_pose_now;
         }
-        if (!fin.good()) break;
     }
     fin.close();
 
     return true;
 }
 
-
 /**
- * @brief 分配权重
- * 
- * @param a 
- * @param max_x 
- * @param min_y 
- * @param max_y 
- * @param x 
- * @return double 
+ *
+ * @param a
+ * @param max_x
+ * @param min_y
+ * @param max_y
+ * @param x
+ * @return
  */
 double weight(double a, double max_x, double min_y, double max_y, double x) {
     double y = (1.0 - std::exp(-a * x)) / (1.0 - std::exp(-a * max_x));
@@ -208,10 +324,9 @@ double weight(double a, double max_x, double min_y, double max_y, double x) {
 
 
 /**
- * @brief 通过噪声计算边的信息矩阵
- * 
- * @param noise 噪声姿态变化
- * @return Eigen::MatrixXd 信息矩阵
+ *
+ * @param change
+ * @return
  */
 Eigen::MatrixXd calc_inf_matrix(Eigen::Isometry3d &noise) {
     if (use_const_inf) {
@@ -244,14 +359,13 @@ Eigen::MatrixXd calc_inf_matrix(Eigen::Isometry3d &noise) {
 
 
 /**
- * @brief 用ros marker显示图中的节点和边
+ * @brief show_markers
  * 
- * @param markers visualization_msgs::MarkerArray &
- * @param nodes const std::vector<g2o::VertexSE3 *> 顶点指针容器
- * @param edges const std::vector<g2o::EdgeSE3 *> 边指针容器
+ * @param markers 
+ * @param nodes 
  */
-void create_marker_array(visualization_msgs::MarkerArray &markers, const std::vector<g2o::VertexSE3 *> &nodes,
-                         const std::vector<g2o::EdgeSE3 *> &edges) {
+void create_marker_array(visualization_msgs::MarkerArray &markers, const std::vector<VertexSE3LieAlgebra *> &nodes,
+                         const std::vector<EdgeSE3LieAlgebra *> &edges) {
     // node markers
     visualization_msgs::Marker &traj_marker = markers.markers[0];
     traj_marker.header.frame_id = "map";
@@ -299,8 +413,8 @@ void create_marker_array(visualization_msgs::MarkerArray &markers, const std::ve
         // Eigen::Vector3d pt1 = v1->estimate().translation();
         // Eigen::Vector3d pt2 = Eigen::Vector3d::Zero();
         // pt2 = pt1 + edge->measurement().translation();
-        g2o::VertexSE3 *v1 = dynamic_cast<g2o::VertexSE3 *>(edge->vertices()[0]);
-        g2o::VertexSE3 *v2 = dynamic_cast<g2o::VertexSE3 *>(edge->vertices()[1]);
+        VertexSE3LieAlgebra *v1 = dynamic_cast<VertexSE3LieAlgebra *>(edge->vertices()[0]);
+        VertexSE3LieAlgebra *v2 = dynamic_cast<VertexSE3LieAlgebra *>(edge->vertices()[1]);
         if (v1 && v2) {
             Eigen::Vector3d pt1 = v1->estimate().translation();
             Eigen::Vector3d pt2 = v2->estimate().translation();
@@ -325,7 +439,7 @@ void create_marker_array(visualization_msgs::MarkerArray &markers, const std::ve
 
 
 /**
- * @brief main function 多机器人运动轨迹图优化仿真
+ * @brief main function
  * 
  * @param argc 
  * @param argv 
@@ -336,45 +450,45 @@ int main(int argc, char **argv) {
     ros::NodeHandle nh("~");
 
     // init
-    std::vector<Eigen::Isometry3d> pose_truth_rb1;    // ground truth rb1
-    std::vector<Eigen::Isometry3d> pose_truth_rb2;    // ground truth rb2
+    std::vector<Eigen::Isometry3d> pose_truth_rb1;  // ground truth rb1
+    std::vector<Eigen::Isometry3d> pose_truth_rb2;  // ground truth rb2
 
-    std::vector<Eigen::Isometry3d> pose_real_rb1;     // 实际带噪声的位姿
-    std::vector<Eigen::Isometry3d> pose_real_rb2;     // 实际带噪声的位姿
+    std::vector<Eigen::Isometry3d> pose_real_rb1;  // 实际带噪声的位姿
+    std::vector<Eigen::Isometry3d> pose_real_rb2;  // 实际带噪声的位姿
 
     std::vector<Eigen::Isometry3d> pose_change_n_rb1;  // 带有噪声的位姿变化
     std::vector<Eigen::Isometry3d> pose_change_n_rb2;  // 带有噪声的位姿变化
 
-    std::vector<Eigen::Isometry3d> pose_change_rb1;    // 位姿变化
-    std::vector<Eigen::Isometry3d> pose_change_rb2;    // 位姿变化
+    std::vector<Eigen::Isometry3d> pose_change_rb1;  // 位姿变化
+    std::vector<Eigen::Isometry3d> pose_change_rb2;  // 位姿变化
 
-    std::vector<Eigen::Isometry3d> noise_rb1;          // 噪声 rb1
-    std::vector<Eigen::Isometry3d> noise_rb2;          // 噪声 rb2
+    std::vector<Eigen::Isometry3d> noise_rb1;      // 噪声 rb1
+    std::vector<Eigen::Isometry3d> noise_rb2;      // 噪声 rb2
 
     const unsigned int rb1_node_start = 0;
     const unsigned int rb2_node_start = 10000;
     const unsigned int sp_edge_start = 20000;
 
-    std::vector<g2o::VertexSE3 *> vectices;  // 顶点容器
-    std::vector<g2o::EdgeSE3 *> edges;       // 边容器
+    std::vector<VertexSE3LieAlgebra *> vectices;  // 顶点容器
+    std::vector<EdgeSE3LieAlgebra *> edges;       // 边容器
 
     std::vector<SpecialNodes> sp_nodes;  // 容器
 
     Eigen::Matrix<double, 6, 6> inf;     // 信息矩阵
-    inf << 40000, 0, 0, 0, 0, 0,
-            0, 40000, 0, 0, 0, 0,
-            0, 0, 40000, 0, 0, 0,
-            0, 0, 0, 10000, 0, 0,
-            0, 0, 0, 0, 10000, 0,
-            0, 0, 0, 0, 0, 10000;
-    
-    // Eigen::Matrix<double, 6, 6> inf;     // 信息矩阵
-    // inf << 100, 0, 0, 0, 0, 0,
-    //         0, 100, 0, 0, 0, 0,
-    //         0, 0, 100, 0, 0, 0,
-    //         0, 0, 0, 400, 0, 0,
-    //         0, 0, 0, 0, 400, 0,
-    //         0, 0, 0, 0, 0, 400;
+    inf << 100, 0, 0, 0, 0, 0,
+            0, 100, 0, 0, 0, 0,
+            0, 0, 100, 0, 0, 0,
+            0, 0, 0, 400, 0, 0,
+            0, 0, 0, 0, 400, 0,
+            0, 0, 0, 0, 0, 400;
+
+    Eigen::Matrix<double, 6, 6> inf_loop;     // 信息矩阵
+    inf << 1, 0, 0, 0, 0, 0,
+            0, 1, 0, 0, 0, 0,
+            0, 0, 1, 0, 0, 0,
+            0, 0, 0, 4, 0, 0,
+            0, 0, 0, 0, 4, 0,
+            0, 0, 0, 0, 0, 4;
 
     // publishers
     visualization_msgs::MarkerArray markers; // 显示标记
@@ -446,9 +560,9 @@ int main(int argc, char **argv) {
     if (!pose_change_rb1.empty())
         for (auto &p: pose_real_rb1) {
             // 顶点
-            g2o::VertexSE3 *v = new g2o::VertexSE3();
+            VertexSE3LieAlgebra *v = new VertexSE3LieAlgebra();
             v->setId(id);
-            v->setEstimate(p);
+            v->set_node(p);
 
             optimizer.addVertex(v); // 优化器添加节点
 
@@ -461,17 +575,14 @@ int main(int argc, char **argv) {
                 v->setFixed(true);
             } else {
                 // SE3-SE3 边
-                int idx1 = id - 1, idx2 = id; // 关联的前后两个顶点
+                int idx1 = id - 1, idx2 = id;           // 关联的前后两个顶点
                 edgeCnt_rb1++;
 
-                g2o::EdgeSE3 *e = new g2o::EdgeSE3();
-                e->setId(id);                                    // 设置边的id
+                EdgeSE3LieAlgebra *e = new EdgeSE3LieAlgebra();
+                e->setId(id);                              // 设置边的id
                 e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点 vertices是map类型
                 e->setVertex(1, optimizer.vertices()[idx2]);
-                e->setMeasurement(pose_change_rb1[id - 1]);
-
-                auto edge_inf = calc_inf_matrix(noise_rb1[id - 1]); // 设置信息矩阵
-                e->setInformation(inf);
+                e->set_edge(pose_change_rb1[id - 1], inf);
 
                 optimizer.addEdge(e);  // 添加边
 
@@ -481,16 +592,17 @@ int main(int argc, char **argv) {
             id++;
         }
 
+
     // robot2 设置节点 和边
     int vertexCnt_rb2 = 0, edgeCnt_rb2 = 0;  // 顶点和边的数量
     id = rb2_node_start;
     if (!pose_change_rb2.empty())
         for (auto &p: pose_real_rb2) {
             // 顶点
-            g2o::VertexSE3 *v = new g2o::VertexSE3();
+            VertexSE3LieAlgebra *v = new VertexSE3LieAlgebra();
             v->setId(id);
             auto rb2_in_rb1 = rb2_2_rb1_trans * p; // rb2_2_rb1_trans 坐标系转换
-            v->setEstimate(rb2_in_rb1);            // 设置节点
+            v->set_node(rb2_in_rb1);// 设置节点
 
             optimizer.addVertex(v);
 
@@ -499,21 +611,18 @@ int main(int argc, char **argv) {
             vectices.push_back(v);
 
             // SE3-SE3 边 从10001开始
-            if (rb2_node_start == id) {  // 以机器人一的坐标系为基准，初始关系s设定为已知
-                // v->setFixed(true);
+            if (rb2_node_start == id) {  // 以机器人一的坐标系为基准
+                v->setFixed(true);
             } else {
                 // SE3-SE3 边
-                int idx1 = id - 1, idx2 = id;               // 关联的前后两个顶点
+                int idx1 = id - 1, idx2 = id;           // 关联的前后两个顶点
                 edgeCnt_rb2++;
 
-                g2o::EdgeSE3 *e = new g2o::EdgeSE3();
+                EdgeSE3LieAlgebra *e = new EdgeSE3LieAlgebra();
                 e->setId(id);                              // 设置边的id
                 e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点
                 e->setVertex(1, optimizer.vertices()[idx2]);
-                e->setMeasurement(pose_change_rb2[id - rb2_node_start - 1]);
-
-                auto edge_inf = calc_inf_matrix(noise_rb2[id - rb2_node_start - 1]); // 设置信息矩阵
-                e->setInformation(inf);
+                e->set_edge(pose_change_rb2[id - rb2_node_start - 1], inf);
 
                 optimizer.addEdge(e); // 添加边
 
@@ -522,6 +631,7 @@ int main(int argc, char **argv) {
             }
             id++;
         }
+
 
     // 回环节点
     std::ifstream fin(loop_data_path);
@@ -542,17 +652,13 @@ int main(int argc, char **argv) {
         temp.prerotate(temp_pc.second);
         temp.pretranslate(temp_pc.first);
 
-        g2o::EdgeSE3 *e = new g2o::EdgeSE3();
+        EdgeSE3LieAlgebra *e = new EdgeSE3LieAlgebra();
         e->setId(id);                                 // 设置边的id
         e->setVertex(0, optimizer.vertices()[idx1]);  // 设置边的两端节点
         e->setVertex(1, optimizer.vertices()[idx2]);
-        e->setMeasurement(temp);
+        e->set_edge(temp, inf_loop);
 
-        auto temp_noise = Eigen::Isometry3d::Identity(); // 设置信息矩阵
-        auto edge_inf = calc_inf_matrix(temp_noise);
-        e->setInformation(inf);
-
-        optimizer.addEdge(e);  // 添加边 加入图
+        optimizer.addEdge(e);  // 添加边
 
         ROS_INFO_STREAM("add edge, id: " << idx1 << " to " << " id : " << idx2);
         edges.push_back(e);
@@ -560,6 +666,18 @@ int main(int argc, char **argv) {
     }
 
     // show
+    int i = 1;
+    for (auto &node: vectices) {
+        cout << "node ID" << i << " DATA " << node->estimate().translation() << endl
+             << node->estimate().rotationMatrix().eulerAngles(0, 1, 2) << endl;
+        i++;
+    }
+    i = 1;
+    for (auto &edge: edges) {
+        cout << "edge ID" << i << " DATA " << edge->measurement().translation() << endl
+             << edge->measurement().rotationMatrix().eulerAngles(0, 1, 2) << endl;
+        i++;
+    }
     ROS_INFO_STREAM("robot 1 " << vertexCnt_rb1 << " vertices, " << edgeCnt_rb1 << " edges.");
     ROS_INFO_STREAM("robot 2 " << vertexCnt_rb2 << " vertices, " << edgeCnt_rb2 << " edges.");
     ROS_INFO_STREAM("optimization start ...");
@@ -569,19 +687,7 @@ int main(int argc, char **argv) {
 
     // display marker
     optimizer.initializeOptimization();
-    // optimizer.optimize(512);  // 优化三十次
 
-    ROS_INFO_STREAM("Before Optimization");
-    for(auto & n : vectices){
-        ROS_INFO_STREAM("id " << n->id() << endl << " " << n->estimate().translation());
-    }
-
-    int i = 1;
-    for (auto &edge: edges) {
-        ROS_INFO_STREAM("edge ID" << i << " DATA " << endl << edge->measurement().translation() << endl
-             << edge->measurement().rotation().eulerAngles(0, 1, 2));
-        i++;
-    }
     // spin
     char c;
     while (ros::ok()) {
@@ -601,11 +707,7 @@ int main(int argc, char **argv) {
             case 'G': {
                 ROS_INFO_STREAM("start optimize at most 512 times ...");
                 // optimizer.initializeOptimization();
-                optimizer.optimize(1024);  // 优化512次
-                ROS_INFO_STREAM("After Optimization");
-                for(auto & n : vectices){
-                    ROS_INFO_STREAM("id " << n->id() << endl << " " << n->estimate().translation());
-                }
+                optimizer.optimize(512);  // 优化三十次
                 break;
             }
             default:
