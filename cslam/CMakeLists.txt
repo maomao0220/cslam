@@ -85,7 +85,8 @@ target_link_libraries(test_algorithm
         ${PCL_LIBRARIES}
         g2o_core
         g2o_stuff
-        g2o_types_slam3d glog::glog
+        g2o_types_slam3d 
+        glog::glog
         ${CHOLMOD_LIBRARIES}
         )
 
@@ -93,9 +94,13 @@ add_executable(test_algorithm_se3 src/cslam/test_algorithm_se3.cpp)
 target_link_libraries(test_algorithm_se3
         ${catkin_LIBRARIES}
         ${PCL_LIBRARIES}
-        g2o_core
+        g2o_core 
+        g2o_solver_eigen
         g2o_stuff
-        g2o_types_slam3d glog::glog
+        g2o_types_slam2d
+        g2o_types_slam3d
+        g2o_types_slam3d_addons
+        glog::glog
         ${CHOLMOD_LIBRARIES}
         )
 
@@ -105,7 +110,8 @@ target_link_libraries(test_algorithm_lie
         ${PCL_LIBRARIES}
         g2o_core
         g2o_stuff
-        g2o_types_slam3d glog::glog
+        g2o_types_slam3d 
+        glog::glog
         ${CHOLMOD_LIBRARIES}
         )
 
@@ -115,7 +121,8 @@ target_link_libraries(test_algorithm_killian
         ${PCL_LIBRARIES}
         g2o_core
         g2o_stuff
-        g2o_types_slam3d glog::glog
+        g2o_types_slam3d 
+        glog::glog
         ${CHOLMOD_LIBRARIES}
         )
 
